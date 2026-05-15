@@ -329,10 +329,72 @@ eventSource.on(
     },
 );
 
+// 流式生图状态：缓存流式阶段已触发的生图结果，供 MESSAGE_RECEIVED 复用
+const streamGenCache = new Map();   // key: prompt, value: imageUrl (或 Promise)
+let streamProcessedTags = 0;        // 流式阶段已处理的 <pic> 标签数量
+let streamMessageId = -1;           // 当前流式消息的 ID
+
+// 每次开始新的一轮生成时重置流式状态
+eventSource.on(event_types.GENERATION_STARTED, () => {
+    streamGenCache.clear();
+    streamProcessedTags = 0;
+    streamMessageId = -1;
+});
+
+// 流式监听：每收到一个 token 就扫描 buffer，发现完整 <pic> 标签立刻调 /sd
+eventSource.on(event_types.STREAM_TOKEN_RECEIVED, (_text, buffer) => {
+    if (
+        !extension_settings[extensionName] ||
+        extension_settings[extensionName].insertType === INSERT_TYPE.DISABLED ||
+        !extension_settings[extensionName].promptInjection ||
+        !extension_settings[extensionName].promptInjection.regex
+    ) {
+        return;
+    }
+
+    const imgTagRegex = regexFromString(
+        extension_settings[extensionName].promptInjection.regex,
+    );
+
+    let matches;
+    if (imgTagRegex.global) {
+        matches = [...buffer.matchAll(imgTagRegex)];
+    } else {
+        const singleMatch = buffer.match(imgTagRegex);
+        matches = singleMatch ? [singleMatch] : [];
+    }
+
+    // 只处理新出现的标签
+    if (matches.length <= streamProcessedTags) return;
+
+    const insertType = extension_settings[extensionName].insertType;
+
+    for (let i = streamProcessedTags; i < matches.length; i++) {
+        const match = matches[i];
+        const prompt = typeof match?.[1] === 'string' ? match[1] : '';
+        if (!prompt.trim()) continue;
+
+        // 避免同一 prompt 重复生图
+        if (streamGenCache.has(prompt)) continue;
+
+        console.log(`[${extensionName}] 流式检测到标签，立刻生图: ${prompt.substring(0, 80)}...`);
+
+        // 立刻触发 /sd，缓存结果
+        const resultPromise = SlashCommandParser.commands['sd'].callback(
+            {
+                quiet: insertType === INSERT_TYPE.NEW_MESSAGE ? 'false' : 'true',
+            },
+            prompt,
+        );
+        streamGenCache.set(prompt, resultPromise);
+    }
+
+    streamProcessedTags = matches.length;
+});
+
 // 监听消息接收事件
 eventSource.on(event_types.MESSAGE_RECEIVED, handleIncomingMessage);
 async function handleIncomingMessage() {
-    // 确保设置对象存在
     if (
         !extension_settings[extensionName] ||
         extension_settings[extensionName].insertType === INSERT_TYPE.DISABLED
@@ -343,12 +405,10 @@ async function handleIncomingMessage() {
     const context = getContext();
     const message = context.chat[context.chat.length - 1];
 
-    // 检查是否是AI消息
     if (!message || message.is_user) {
         return;
     }
 
-    // 确保promptInjection对象和regex属性存在
     if (
         !extension_settings[extensionName].promptInjection ||
         !extension_settings[extensionName].promptInjection.regex
@@ -357,11 +417,9 @@ async function handleIncomingMessage() {
         return;
     }
 
-    // 使用正则表达式search
     const imgTagRegex = regexFromString(
         extension_settings[extensionName].promptInjection.regex,
     );
-    // const testRegex = regexFromString(extension_settings[extensionName].promptInjection.regex);
     let matches;
     if (imgTagRegex.global) {
         matches = [...message.mes.matchAll(imgTagRegex)];
@@ -371,24 +429,19 @@ async function handleIncomingMessage() {
     }
     console.log(imgTagRegex, matches);
     if (matches.length > 0) {
-        // 延迟执行图片生成，确保消息首先显示出来
         setTimeout(async () => {
             try {
                 toastr.info(`Generating ${matches.length} images...`);
                 const insertType = extension_settings[extensionName].insertType;
 
-                // 在当前消息中插入图片
-                // 初始化message.extra
                 if (!message.extra) {
                     message.extra = {};
                 }
 
-                // 初始化image_swipes数组
                 if (!Array.isArray(message.extra.image_swipes)) {
                     message.extra.image_swipes = [];
                 }
 
-                // 如果已有图片，添加到swipes
                 if (
                     message.extra.image &&
                     !message.extra.image_swipes.includes(message.extra.image)
@@ -396,12 +449,10 @@ async function handleIncomingMessage() {
                     message.extra.image_swipes.push(message.extra.image);
                 }
 
-                // 获取消息元素用于稍后更新
                 const messageElement = $(
                     `.mes[mesid="${context.chat.length - 1}"]`,
                 );
 
-                // 处理每个匹配的图片标签
                 for (const match of matches) {
                     const prompt =
                         typeof match?.[1] === 'string' ? match[1] : '';
@@ -409,37 +460,37 @@ async function handleIncomingMessage() {
                         continue;
                     }
 
-                    // @ts-ignore
-                    const result = await SlashCommandParser.commands[
-                        'sd'
-                    ].callback(
-                        {
-                            quiet:
-                                insertType === INSERT_TYPE.NEW_MESSAGE
-                                    ? 'false'
-                                    : 'true',
-                        },
-                        prompt,
-                    );
-                    // 统一插入到extra里
+                    // 复用流式阶段已触发的生图结果，避免重复调用 /sd
+                    let result;
+                    if (streamGenCache.has(prompt)) {
+                        result = await streamGenCache.get(prompt);
+                        console.log(`[${extensionName}] 复用流式缓存: ${prompt.substring(0, 50)}...`);
+                    } else {
+                        // @ts-ignore
+                        result = await SlashCommandParser.commands[
+                            'sd'
+                        ].callback(
+                            {
+                                quiet:
+                                    insertType === INSERT_TYPE.NEW_MESSAGE
+                                        ? 'false'
+                                        : 'true',
+                            },
+                            prompt,
+                        );
+                    }
+
                     if (insertType === INSERT_TYPE.INLINE) {
                         let imageUrl = result;
                         if (
                             typeof imageUrl === 'string' &&
                             imageUrl.trim().length > 0
                         ) {
-                            // 添加图片到swipes数组
                             message.extra.image_swipes.push(imageUrl);
-
-                            // 设置第一张图片为主图片，或更新为最新生成的图片
                             message.extra.image = imageUrl;
                             message.extra.title = prompt;
                             message.extra.inline_image = true;
-
-                            // 更新UI
                             appendMediaToMessage(message, messageElement);
-
-                            // 保存聊天记录
                             await context.saveChat();
                         }
                     } else if (insertType === INSERT_TYPE.REPLACE) {
@@ -448,13 +499,11 @@ async function handleIncomingMessage() {
                             typeof imageUrl === 'string' &&
                             imageUrl.trim().length > 0
                         ) {
-                            // Find the original image tag in the message
                             const originalTag =
                                 typeof match?.[0] === 'string' ? match[0] : '';
                             if (!originalTag) {
                                 continue;
                             }
-                            // Replace it with an actual image tag
                             const escapedUrl = escapeHtmlAttribute(imageUrl);
                             const escapedPrompt = escapeHtmlAttribute(prompt);
                             const newImageTag = `<img src="${escapedUrl}" title="${escapedPrompt}" alt="${escapedPrompt}">`;
@@ -462,8 +511,6 @@ async function handleIncomingMessage() {
                                 originalTag,
                                 newImageTag,
                             );
-
-                            // Update the message display using updateMessageBlock
                             updateMessageBlock(
                                 context.chat.length - 1,
                                 message,
@@ -472,8 +519,6 @@ async function handleIncomingMessage() {
                                 event_types.MESSAGE_UPDATED,
                                 context.chat.length - 1,
                             );
-
-                            // Save the chat
                             await context.saveChat();
                         }
                     }
@@ -485,6 +530,6 @@ async function handleIncomingMessage() {
                 toastr.error(`Image generation error: ${error}`);
                 console.error('Image generation error:', error);
             }
-        }, 0); //防阻塞UI渲染
+        }, 0);
     }
 }

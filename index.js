@@ -335,75 +335,83 @@ let streamProcessedTags = 0;        // 流式阶段已处理的 <pic> 标签数�
 let streamMessageId = -1;           // 当前流式消息的 ID
 
 // 每次开始新的一轮生成时重置流式状态
+let streamBuffer = '';  // 手动拼接的流式 buffer
 eventSource.on(event_types.GENERATION_STARTED, () => {
     streamGenCache.clear();
     streamProcessedTags = 0;
     streamMessageId = -1;
+    streamBuffer = '';
     console.log(`[${extensionName}] GENERATION_STARTED — 流式缓存已重置`);
 });
 
-// 流式监听：每收到一个 token 就扫描 buffer，发现完整 <pic> 标签立刻调 /sd
-// 同时尝试 event_types 常量和裸字符串，兼容不同 ST 版本
-function setupStreamListener(eventType, label) {
-    if (!eventType) return;
-    let firstToken = true;
-    eventSource.on(eventType, (_text, buffer) => {
-        if (firstToken) {
-            console.log(`[${extensionName}] 流式事件触发 (${label}) ✓ — buffer长度: ${buffer?.length || 0}`);
-            firstToken = false;
-        }
-
-        if (
-            !extension_settings[extensionName] ||
-            extension_settings[extensionName].insertType === INSERT_TYPE.DISABLED ||
-            !extension_settings[extensionName].promptInjection ||
-            !extension_settings[extensionName].promptInjection.regex
-        ) {
-            return;
-        }
-
-        const imgTagRegex = regexFromString(
-            extension_settings[extensionName].promptInjection.regex,
-        );
-
-        let matches;
-        if (imgTagRegex.global) {
-            matches = [...buffer.matchAll(imgTagRegex)];
+// 流式监听：每收到一个 token 就手动拼接 buffer，发现完整 <pic> 标签立刻调 /sd
+eventSource.on(event_types.STREAM_TOKEN_RECEIVED, (data) => {
+    // 兼容不同 ST 版本的参数格式
+    let token;
+    if (typeof data === 'string') {
+        token = data;
+    } else if (data && typeof data === 'object') {
+        token = data.text || data.token || '';
+        // 如果事件自带 buffer 就用，否则手动拼接
+        if (data.buffer) {
+            streamBuffer = data.buffer;
         } else {
-            const singleMatch = buffer.match(imgTagRegex);
-            matches = singleMatch ? [singleMatch] : [];
+            streamBuffer += token;
         }
+    } else {
+        return;
+    }
 
-        if (matches.length <= streamProcessedTags) return;
+    // 手动拼接
+    if (typeof data === 'string') {
+        streamBuffer += token;
+    }
 
-        const insertType = extension_settings[extensionName].insertType;
+    if (
+        !extension_settings[extensionName] ||
+        extension_settings[extensionName].insertType === INSERT_TYPE.DISABLED ||
+        !extension_settings[extensionName].promptInjection ||
+        !extension_settings[extensionName].promptInjection.regex
+    ) {
+        return;
+    }
 
-        for (let i = streamProcessedTags; i < matches.length; i++) {
-            const match = matches[i];
-            const prompt = typeof match?.[1] === 'string' ? match[1] : '';
-            if (!prompt.trim()) continue;
+    const imgTagRegex = regexFromString(
+        extension_settings[extensionName].promptInjection.regex,
+    );
 
-            if (streamGenCache.has(prompt)) continue;
+    let matches;
+    if (imgTagRegex.global) {
+        matches = [...streamBuffer.matchAll(imgTagRegex)];
+    } else {
+        const singleMatch = streamBuffer.match(imgTagRegex);
+        matches = singleMatch ? [singleMatch] : [];
+    }
 
-            console.log(`[${extensionName}] 流式检测到标签，立刻生图: ${prompt.substring(0, 80)}...`);
+    if (matches.length <= streamProcessedTags) return;
 
-            const resultPromise = SlashCommandParser.commands['sd'].callback(
-                {
-                    quiet: insertType === INSERT_TYPE.NEW_MESSAGE ? 'false' : 'true',
-                },
-                prompt,
-            );
-            streamGenCache.set(prompt, resultPromise);
-        }
+    const insertType = extension_settings[extensionName].insertType;
 
-        streamProcessedTags = matches.length;
-    });
-}
+    for (let i = streamProcessedTags; i < matches.length; i++) {
+        const match = matches[i];
+        const prompt = typeof match?.[1] === 'string' ? match[1] : '';
+        if (!prompt.trim()) continue;
 
-setupStreamListener(event_types.STREAM_TOKEN_RECEIVED, 'event_types');
-setupStreamListener('STREAM_TOKEN_RECEIVED', '裸字符串');
-setupStreamListener('STREAMING_TOKEN_RECEIVED', '备用名1');
-setupStreamListener('TOKEN_RECEIVED', '备用名2');
+        if (streamGenCache.has(prompt)) continue;
+
+        console.log(`[${extensionName}] 流式检测到标签，立刻生图 (第${i + 1}个): ${prompt.substring(0, 80)}...`);
+
+        const resultPromise = SlashCommandParser.commands['sd'].callback(
+            {
+                quiet: insertType === INSERT_TYPE.NEW_MESSAGE ? 'false' : 'true',
+            },
+            prompt,
+        );
+        streamGenCache.set(prompt, resultPromise);
+    }
+
+    streamProcessedTags = matches.length;
+});
 
 // 监听消息接收事件
 eventSource.on(event_types.MESSAGE_RECEIVED, handleIncomingMessage);
